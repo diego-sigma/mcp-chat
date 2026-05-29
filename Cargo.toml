@@ -1,0 +1,33 @@
+[package]
+name = "mcp-chat"
+version = "0.1.0"
+edition = "2024"
+description = "Minimal CLI for driving any MCP server through any OpenRouter-backed LLM, plus a session replay tool."
+default-run = "mcp-chat"
+
+[dependencies]
+# Pinned to avoid versions released within the last 3 days (org policy, 2026-05-14).
+rmcp = { version = "=1.6.0", default-features = false, features = [
+    "client",
+    "transport-streamable-http-client-reqwest",
+] }
+tokio = { version = "1.51", features = ["full"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+dotenvy = "0.15"
+rustyline = "17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+base64 = "0.22"
+http = "1"
+sse-stream = "0.2"
+futures = "0.3"
+nu-ansi-term = "0.50"
+termimad = "0.34"
+indicatif = "0.18"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[profile.release]
+lto = "thin"
