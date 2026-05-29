@@ -128,10 +128,16 @@ pub fn pad_screen_bottom(lines: usize) {
 
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
-        s.to_string()
-    } else {
-        let mut out = s[..max].to_string();
-        out.push_str("… [truncated]");
-        out
+        return s.to_string();
     }
+    // Slicing a `&str` requires landing on a UTF-8 char boundary — `max`
+    // may fall mid-codepoint (common with box-drawing chars from DDL
+    // tables, emoji, etc.). Walk back until we find a boundary.
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = s[..end].to_string();
+    out.push_str("… [truncated]");
+    out
 }
