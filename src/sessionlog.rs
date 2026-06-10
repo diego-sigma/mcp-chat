@@ -1,7 +1,7 @@
-use std::fs::{File, OpenOptions, create_dir_all};
-use std::io::Write;
+use std::fs::{OpenOptions, create_dir_all};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -10,9 +10,32 @@ use serde_json::{Value, json};
 /// JSONL session log. Each call to a log method appends one line containing
 /// `{ts, event, ...payload}`. Best-effort: write failures are dropped so a
 /// broken disk doesn't kill the REPL.
+///
+/// The backing writer is pluggable — `open()` writes to a file on disk,
+/// `open_buffer()` writes to an in-memory buffer (used for the one-shot
+/// `--from-log` + `--prompt` mode which captures the new turn to emit as
+/// JSON instead of persisting it).
 pub struct SessionLog {
-    inner: Mutex<File>,
-    pub path: PathBuf,
+    inner: Mutex<Box<dyn Write + Send>>,
+    pub path: Option<PathBuf>,
+}
+
+/// `Write` adapter that funnels bytes into a shared `Vec<u8>`. The holder of
+/// the cloned `Arc` can read the accumulated bytes once the log is dropped
+/// (or while it's idle).
+#[derive(Clone)]
+struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl Write for SharedBuffer {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Ok(mut v) = self.0.lock() {
+            v.extend_from_slice(buf);
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl SessionLog {
@@ -30,9 +53,22 @@ impl SessionLog {
             .open(&path)
             .with_context(|| format!("open log file {}", path.display()))?;
         Ok(Self {
-            inner: Mutex::new(file),
-            path,
+            inner: Mutex::new(Box::new(file)),
+            path: Some(path),
         })
+    }
+
+    /// Returns a SessionLog whose writes accumulate in a shared in-memory
+    /// buffer. Hold the returned `Arc<Mutex<Vec<u8>>>` to read the captured
+    /// bytes back (typically after dropping the SessionLog).
+    pub fn open_buffer() -> (Self, Arc<Mutex<Vec<u8>>>) {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = SharedBuffer(buf.clone());
+        let log = Self {
+            inner: Mutex::new(Box::new(sink)),
+            path: None,
+        };
+        (log, buf)
     }
 
     fn write(&self, mut event: Value) {

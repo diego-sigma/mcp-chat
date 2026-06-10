@@ -51,6 +51,70 @@ struct ToolCallFunction {
     arguments: String,
 }
 
+/// Non-interactive single-turn driver. Loads `prior_history` (already in
+/// OpenAI message format), appends `prompt` as a new user turn, runs one
+/// model turn (the full tool-call loop until `stop_reason == "end_turn"`),
+/// and returns. Logging events go through `log` like the REPL does, so
+/// callers can capture the new turn via an in-memory `SessionLog` buffer.
+pub async fn run_oneshot(
+    mcp_service: McpService,
+    cfg: ChatConfig,
+    mut prior_history: Vec<Value>,
+    prompt: String,
+    ui: Ui,
+    log: Option<&SessionLog>,
+) -> Result<()> {
+    let tools = mcp::list_tools(&mcp_service).await?;
+    let openai_tools: Vec<Value> = bridge::to_openai_tools(&tools);
+    let http = reqwest::Client::new();
+
+    // Only inject the system prompt if the prior history doesn't already
+    // begin with one — otherwise we'd double up.
+    let has_system = prior_history
+        .first()
+        .and_then(|m| m.get("role"))
+        .and_then(|r| r.as_str())
+        == Some("system");
+    if let Some(sys) = cfg.system_prompt.as_ref()
+        && !has_system
+    {
+        prior_history.insert(0, json!({ "role": "system", "content": sys }));
+    }
+
+    if let Some(l) = log {
+        l.session_start(&cfg.model, &cfg.base_url, cfg.system_prompt.as_deref());
+    }
+
+    prior_history.push(json!({ "role": "user", "content": prompt }));
+    if let Some(l) = log {
+        l.user(&prompt);
+    }
+
+    if let Err(e) = handle_turn(
+        &http,
+        &cfg,
+        &mcp_service,
+        &openai_tools,
+        &mut prior_history,
+        &ui,
+        log,
+    )
+    .await
+    {
+        let msg = format!("{e:#}");
+        ui.error(&msg);
+        if let Some(l) = log {
+            l.error(&msg);
+        }
+        return Err(e);
+    }
+
+    if let Some(l) = log {
+        l.session_end();
+    }
+    Ok(())
+}
+
 pub async fn run(
     mcp_service: McpService,
     cfg: ChatConfig,

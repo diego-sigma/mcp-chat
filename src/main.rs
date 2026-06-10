@@ -1,8 +1,11 @@
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use clap::{ArgAction, Parser};
 use http::{HeaderMap, HeaderName, HeaderValue};
+use serde_json::{Value, json};
 
 use mcp_chat::auth::TokenManager;
 use mcp_chat::chat::{self, ChatConfig};
@@ -84,6 +87,78 @@ struct Args {
     /// out-of-band state without changing any MCP tool signatures.
     #[arg(long = "mcp-header", value_name = "NAME: VALUE", action = ArgAction::Append)]
     mcp_header: Vec<String>,
+
+    /// Non-interactive mode: load this .jsonl session log into history and
+    /// run a single turn against `--prompt`, then emit `{model, events: [...]}`
+    /// as JSON on stdout and exit. The REPL is skipped. Tool calls still hit
+    /// the live MCP server. UI events (spinner, tool prints) go to stderr,
+    /// so stdout stays clean for piping to `jq`.
+    #[arg(long, value_name = "PATH", requires = "prompt")]
+    from_log: Option<PathBuf>,
+
+    /// New user message for non-interactive mode (used with `--from-log`).
+    #[arg(long, requires = "from_log")]
+    prompt: Option<String>,
+}
+
+/// Parse a `.jsonl` session log into an OpenAI Chat Completions message
+/// array (`Vec<Value>`). Skips bookkeeping events (session_start, error,
+/// session_end, bare tool_call) and converts each user/assistant/tool_result
+/// event into the corresponding `{role, ...}` message. Malformed lines are
+/// skipped with a warning on stderr.
+fn load_history_from_log(path: &Path) -> Result<Vec<Value>> {
+    let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let reader = BufReader::new(f);
+    let mut history: Vec<Value> = Vec::new();
+
+    for (i, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| format!("read line {}", i + 1))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("warn: skipping malformed log line {}: {e}", i + 1);
+                continue;
+            }
+        };
+        let kind = event.get("event").and_then(Value::as_str).unwrap_or("");
+        match kind {
+            "session_start" | "error" | "session_end" | "tool_call" => {
+                // tool_call is redundant — the assistant event already
+                // contains the structured tool_calls array.
+            }
+            "user" => {
+                let content = event.get("content").and_then(Value::as_str).unwrap_or("");
+                history.push(json!({ "role": "user", "content": content }));
+            }
+            "assistant" => {
+                let content = event.get("content").cloned().unwrap_or(Value::Null);
+                let mut msg = json!({ "role": "assistant", "content": content });
+                if let Some(tc) = event.get("tool_calls").filter(|v| !v.is_null()) {
+                    msg["tool_calls"] = tc.clone();
+                }
+                history.push(msg);
+            }
+            "tool_result" => {
+                let id = event
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let content = event.get("content").and_then(Value::as_str).unwrap_or("");
+                history.push(json!({
+                    "role": "tool",
+                    "tool_call_id": id,
+                    "content": content,
+                }));
+            }
+            other => {
+                eprintln!("warn: unknown event type '{other}' at line {}", i + 1);
+            }
+        }
+    }
+    Ok(history)
 }
 
 fn parse_headers(raw: &[String]) -> Result<HeaderMap> {
@@ -175,12 +250,49 @@ async fn main() -> Result<()> {
         args.openrouter_base_url, args.model, provider_note
     ));
 
+    // Non-interactive one-shot mode: --from-log + --prompt.
+    if let (Some(log_path), Some(prompt)) = (args.from_log.clone(), args.prompt.clone()) {
+        let prior_history = load_history_from_log(&log_path)
+            .with_context(|| format!("load history from {}", log_path.display()))?;
+        ui.system_info(&format!(
+            "Loaded {} messages from {}",
+            prior_history.len(),
+            log_path.display()
+        ));
+
+        let (capture_log, buf) = SessionLog::open_buffer();
+        let cfg = ChatConfig {
+            api_key: args.openrouter_api_key,
+            base_url: args.openrouter_base_url,
+            model: args.model.clone(),
+            system_prompt: args.system,
+            provider_order,
+        };
+        chat::run_oneshot(mcp_service, cfg, prior_history, prompt, ui, Some(&capture_log)).await?;
+        // Drop the log so its writer flushes/releases the shared buffer.
+        drop(capture_log);
+
+        let bytes = buf.lock().map_err(|_| anyhow!("log buffer poisoned"))?;
+        let events: Vec<Value> = std::str::from_utf8(&bytes)
+            .context("log buffer was not valid utf-8")?
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+
+        let output = json!({ "model": args.model, "events": events });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
+
     let log = if args.no_log {
         None
     } else {
         match SessionLog::open(&args.log_dir, &args.model) {
             Ok(l) => {
-                ui.system_info(&format!("Logging session to {}", l.path.display()));
+                if let Some(p) = l.path.as_ref() {
+                    ui.system_info(&format!("Logging session to {}", p.display()));
+                }
                 Some(l)
             }
             Err(e) => {
