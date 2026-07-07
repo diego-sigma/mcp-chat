@@ -38,6 +38,26 @@ impl Write for SharedBuffer {
     }
 }
 
+/// `Write` fan-out that mirrors every write to both an underlying writer
+/// (typically a file) and a shared in-memory buffer. Used by the one-shot
+/// mode with `--session-id`: the session log persists AND the new-turn
+/// bytes are captured for the stdout JSON.
+struct TeeWrite {
+    file: Box<dyn Write + Send>,
+    buf: SharedBuffer,
+}
+
+impl Write for TeeWrite {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.file.write_all(buf)?;
+        let _ = self.buf.write(buf); // buffer write is infallible in practice
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
 impl SessionLog {
     pub fn open(dir: &Path, model: &str) -> Result<Self> {
         create_dir_all(dir).with_context(|| format!("create log dir {}", dir.display()))?;
@@ -69,6 +89,49 @@ impl SessionLog {
             path: None,
         };
         (log, buf)
+    }
+
+    /// Deterministic filename form: `<dir>/session-<id>.jsonl`. Opens in
+    /// append mode, so repeated calls with the same id grow one log file.
+    /// Callers that want to append to a session across invocations pass
+    /// the same id every time.
+    pub fn open_with_id(dir: &Path, id: &str) -> Result<Self> {
+        create_dir_all(dir).with_context(|| format!("create log dir {}", dir.display()))?;
+        let path = dir.join(format!("session-{id}.jsonl"));
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("open log file {}", path.display()))?;
+        Ok(Self {
+            inner: Mutex::new(Box::new(file)),
+            path: Some(path),
+        })
+    }
+
+    /// Same as `open_with_id` but also mirrors every write into an in-memory
+    /// buffer so the one-shot mode can emit the new turn to stdout while
+    /// persisting it to disk.
+    pub fn open_with_id_tee(dir: &Path, id: &str) -> Result<(Self, Arc<Mutex<Vec<u8>>>)> {
+        create_dir_all(dir).with_context(|| format!("create log dir {}", dir.display()))?;
+        let path = dir.join(format!("session-{id}.jsonl"));
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("open log file {}", path.display()))?;
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let tee = TeeWrite {
+            file: Box::new(file),
+            buf: SharedBuffer(buf.clone()),
+        };
+        Ok((
+            Self {
+                inner: Mutex::new(Box::new(tee)),
+                path: Some(path),
+            },
+            buf,
+        ))
     }
 
     fn write(&self, mut event: Value) {

@@ -93,12 +93,21 @@ struct Args {
     /// as JSON on stdout and exit. The REPL is skipped. Tool calls still hit
     /// the live MCP server. UI events (spinner, tool prints) go to stderr,
     /// so stdout stays clean for piping to `jq`.
-    #[arg(long, value_name = "PATH", requires = "prompt")]
+    #[arg(long, value_name = "PATH")]
     from_log: Option<PathBuf>,
 
-    /// New user message for non-interactive mode (used with `--from-log`).
-    #[arg(long, requires = "from_log")]
+    /// New user message. When set, the REPL is skipped and the CLI runs a
+    /// single turn against the loaded history (`--from-log` or `--session-id`).
+    #[arg(long)]
     prompt: Option<String>,
+
+    /// Deterministic session id. When set, the log lives at
+    /// `<log_dir>/session-<ID>.jsonl` and is opened in append mode — so
+    /// repeated invocations with the same id grow one log file. In one-shot
+    /// mode (`--prompt` set), if `--from-log` isn't given, the session file
+    /// itself is used as the history source.
+    #[arg(long, env = "MCP_CHAT_SESSION_ID")]
+    session_id: Option<String>,
 }
 
 /// Parse a `.jsonl` session log into an OpenAI Chat Completions message
@@ -250,17 +259,44 @@ async fn main() -> Result<()> {
         args.openrouter_base_url, args.model, provider_note
     ));
 
-    // Non-interactive one-shot mode: --from-log + --prompt.
-    if let (Some(log_path), Some(prompt)) = (args.from_log.clone(), args.prompt.clone()) {
-        let prior_history = load_history_from_log(&log_path)
-            .with_context(|| format!("load history from {}", log_path.display()))?;
-        ui.system_info(&format!(
-            "Loaded {} messages from {}",
-            prior_history.len(),
-            log_path.display()
-        ));
+    // Non-interactive one-shot mode: triggered by `--prompt`.
+    if let Some(prompt) = args.prompt.clone() {
+        // History source, in priority order:
+        //   1. `--from-log <PATH>` (explicit override)
+        //   2. `<log_dir>/session-<ID>.jsonl` if the session file exists
+        //   3. empty history (brand-new session)
+        let history_path = args
+            .from_log
+            .clone()
+            .or_else(|| args.session_id.as_ref().map(|id| session_path(&args.log_dir, id)));
+        let prior_history = match history_path.as_ref() {
+            Some(p) if p.exists() => {
+                let h = load_history_from_log(p)
+                    .with_context(|| format!("load history from {}", p.display()))?;
+                ui.system_info(&format!("Loaded {} messages from {}", h.len(), p.display()));
+                h
+            }
+            _ => {
+                ui.system_info("Starting from empty history.");
+                Vec::new()
+            }
+        };
 
-        let (capture_log, buf) = SessionLog::open_buffer();
+        // Log destination: file-backed if session-id is set (append mode),
+        // in-memory-only otherwise. Either way we capture the new turn's
+        // events into a buffer for the stdout JSON.
+        let (capture_log, buf) = match (args.session_id.as_deref(), args.no_log) {
+            (Some(id), false) => {
+                let (l, b) = SessionLog::open_with_id_tee(&args.log_dir, id)
+                    .with_context(|| format!("open session log for id={id}"))?;
+                if let Some(p) = l.path.as_ref() {
+                    ui.system_info(&format!("Appending session to {}", p.display()));
+                }
+                (l, b)
+            }
+            _ => SessionLog::open_buffer(),
+        };
+
         let cfg = ChatConfig {
             api_key: args.openrouter_api_key,
             base_url: args.openrouter_base_url,
@@ -269,7 +305,7 @@ async fn main() -> Result<()> {
             provider_order,
         };
         chat::run_oneshot(mcp_service, cfg, prior_history, prompt, ui, Some(&capture_log)).await?;
-        // Drop the log so its writer flushes/releases the shared buffer.
+        // Drop the log so its writer flushes / releases the shared buffer.
         drop(capture_log);
 
         let bytes = buf.lock().map_err(|_| anyhow!("log buffer poisoned"))?;
@@ -280,15 +316,27 @@ async fn main() -> Result<()> {
             .filter_map(|l| serde_json::from_str(l).ok())
             .collect();
 
-        let output = json!({ "model": args.model, "events": events });
+        let mut output = json!({ "model": args.model, "events": events });
+        if let Some(id) = args.session_id.as_deref() {
+            output["session_id"] = Value::String(id.to_string());
+        }
         println!("{}", serde_json::to_string_pretty(&output)?);
         return Ok(());
+    }
+
+    // REPL mode. If `--from-log` is set without `--prompt`, that's a misuse.
+    if args.from_log.is_some() {
+        anyhow::bail!("--from-log requires --prompt (one-shot mode). For REPL history reuse, pass --session-id instead.");
     }
 
     let log = if args.no_log {
         None
     } else {
-        match SessionLog::open(&args.log_dir, &args.model) {
+        let opened = match args.session_id.as_deref() {
+            Some(id) => SessionLog::open_with_id(&args.log_dir, id),
+            None => SessionLog::open(&args.log_dir, &args.model),
+        };
+        match opened {
             Ok(l) => {
                 if let Some(p) = l.path.as_ref() {
                     ui.system_info(&format!("Logging session to {}", p.display()));
@@ -315,4 +363,8 @@ async fn main() -> Result<()> {
         log,
     )
     .await
+}
+
+fn session_path(log_dir: &Path, id: &str) -> PathBuf {
+    log_dir.join(format!("session-{id}.jsonl"))
 }
